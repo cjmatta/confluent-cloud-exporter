@@ -9,11 +9,23 @@ import (
 	"strings"
 	"time"
 
+	"confluent-cloud-exporter/collector"
 	"confluent-cloud-exporter/config"
+	"confluent-cloud-exporter/discovery"
+	"confluent-cloud-exporter/metrics"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/viper"
 )
+
+// dummyResourceProvider implements the ResourceProvider interface for initial testing
+type dummyResourceProvider struct{}
+
+func (d *dummyResourceProvider) GetResources() []discovery.DiscoveredResource {
+	// Return an empty slice for now
+	return []discovery.DiscoveredResource{}
+}
 
 func main() {
 	// Define command line flags
@@ -76,8 +88,25 @@ func main() {
 		"apiKeyConfigured", cfg.ConfluentAPIKey != "",
 	)
 
+	// Create metrics descriptors
+	metricDescriptors := metrics.NewMetricsDescriptors()
+
+	// Create a dummy resource provider for now
+	resourceProvider := &dummyResourceProvider{}
+
+	// Create and register the collector
+	confluent := collector.NewCollector(cfg, resourceProvider, metricDescriptors, logger)
+	prometheus.MustRegister(confluent)
+
 	// Register Prometheus metrics handler
 	http.Handle("/metrics", promhttp.Handler())
+
+	// Add a simple health check endpoint
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
 
 	// Start HTTP server
 	logger.Info("HTTP server listening", "address", cfg.ListenAddress)

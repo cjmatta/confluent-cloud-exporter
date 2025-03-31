@@ -27,6 +27,7 @@ const (
 	ResourceTypeConnector      = "connector"
 	ResourceTypeKsqlDB         = "ksqldb"
 	ResourceTypeConnectCluster = "connect_cluster"
+	ResourceTypeComputePool    = "compute_pool"
 )
 
 // Standard label sets used for different resource types

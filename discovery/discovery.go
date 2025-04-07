@@ -133,3 +133,9 @@ func (d *DiscoveryService) GetLastRefreshError() error {
 	defer d.mutex.RUnlock()
 	return d.lastRefreshError
 }
+
+func (d *DiscoveryService) IsReady() bool {
+	d.mutex.RLock()
+	defer d.mutex.RUnlock()
+	return d.lastRefreshTime.After(time.Time{}) && d.lastRefreshError == nil
+}

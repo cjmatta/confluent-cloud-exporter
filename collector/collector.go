@@ -78,39 +78,30 @@ func (c *ConfluentCollector) SetLogger(logger *slog.Logger) {
 // updateResourcesFromDiscovery refreshes the resources from the discovery service.
 // It returns true if resources were updated, false otherwise.
 func (c *ConfluentCollector) updateResourcesFromDiscovery(ctx context.Context) (bool, error) {
-	// Just check if we have resources already
-	c.resourceMutex.RLock()
-	resourceCount := len(c.resourcesByID)
-	lastRefresh := c.lastRefresh
-	c.resourceMutex.RUnlock()
-
-	if resourceCount == 0 {
+	// First check if discovery service is ready
+	if !c.discoveryService.IsReady() {
 		return false, fmt.Errorf("no resources available yet, initial discovery may still be in progress")
 	}
 
-	c.logger.Debug("Using cached resources",
-		"resource_count", resourceCount,
-		"cache_age", time.Since(lastRefresh).String())
-
-	return false, nil
-}
-
-// RefreshResourcesAsync refreshes resources from the discovery service in the background
-func (c *ConfluentCollector) RefreshResourcesAsync(ctx context.Context) error {
-	startTime := time.Now()
-	c.logger.Debug("Starting background resource discovery")
-
-	if err := c.discoveryService.RefreshResources(ctx); err != nil {
-		c.logger.Error("Failed to refresh resources", "error", err)
-		return err
+	// If resources are still fresh, don't refresh
+	if !c.lastRefresh.IsZero() && time.Since(c.lastRefresh) < c.cacheDuration {
+		c.logger.Debug("Using cached resources",
+			"age", time.Since(c.lastRefresh).String(),
+			"expires_in", (c.cacheDuration - time.Since(c.lastRefresh)).String())
+		return false, nil
 	}
 
-	// Get resources from discovery service
+	// Get fresh resources from discovery service
 	resources := c.discoveryService.GetResources()
 
-	// Process and update the resources
-	resourcesByType := make(map[string]int)
+	if len(resources) == 0 {
+		c.logger.Warn("Discovery service returned empty resources list")
+		return false, fmt.Errorf("discovery service returned no resources")
+	}
+
+	// Update our local cache
 	newResourcesByID := make(map[string]discovery.DiscoveredResource)
+	resourcesByType := make(map[string]int)
 
 	for _, resource := range resources {
 		resourcesByType[resource.Type]++
@@ -128,10 +119,33 @@ func (c *ConfluentCollector) RefreshResourcesAsync(ctx context.Context) error {
 	c.lastRefresh = time.Now()
 	c.resourceMutex.Unlock()
 
-	c.logger.Info("Background resource discovery completed",
-		"duration", time.Since(startTime).String(),
+	c.logger.Info("Updated resources from discovery service",
 		"resource_count", len(newResourcesByID),
 		"types", len(resourcesByType))
+
+	return true, nil
+}
+
+// RefreshResourcesAsync refreshes resources from the discovery service in the background
+func (c *ConfluentCollector) RefreshResourcesAsync(ctx context.Context) error {
+	startTime := time.Now()
+	c.logger.Debug("Starting background resource discovery")
+
+	// Perform the discovery
+	if err := c.discoveryService.RefreshResources(ctx); err != nil {
+		c.logger.Error("Failed to refresh resources", "error", err)
+		return err
+	}
+
+	// After successful discovery, update our local cache
+	_, err := c.updateResourcesFromDiscovery(ctx)
+	if err != nil {
+		c.logger.Warn("Discovery completed but failed to update collector resources", "error", err)
+		// Don't return error here - discovery was successful even if we couldn't update
+	}
+
+	c.logger.Info("Background resource discovery completed",
+		"duration", time.Since(startTime).String())
 
 	return nil
 }
@@ -175,7 +189,10 @@ func (c *ConfluentCollector) Collect(ch chan<- prometheus.Metric) {
 	resourcesUpdated, err := c.updateResourcesFromDiscovery(ctx)
 	if err != nil {
 		c.logger.Error("Failed to update resources", "error", err)
-		c.up.Set(0)
+		// Don't set up=0 for resource discovery in progress - that's not an API failure
+		if !strings.Contains(err.Error(), "initial discovery may still be in progress") {
+			c.up.Set(0)
+		}
 		return
 	}
 
@@ -215,20 +232,6 @@ func (c *ConfluentCollector) Collect(ch chan<- prometheus.Metric) {
 	c.logger.Debug("Completed metrics collection",
 		"duration", time.Since(startTime).String(),
 		"updated_resources", resourcesUpdated)
-}
-
-// Helper function to convert discovery resources to metric resources
-func convertDiscoveredResourcesToMetricResources(resources []discovery.DiscoveredResource) []map[string]string {
-	metricResources := make([]map[string]string, len(resources))
-	for i, r := range resources {
-		// Create a map with resource ID and type
-		resource := map[string]string{
-			"id":   r.ID,
-			"type": r.Type,
-		}
-		metricResources[i] = resource
-	}
-	return metricResources
 }
 
 // processMetrics parses Prometheus text format metrics and sends them to the channel.

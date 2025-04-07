@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -243,119 +242,78 @@ func (c *Client) createRequest(ctx context.Context, method, path string, queryPa
 
 // makeRequestWithRetry performs an HTTP request with retries and backoff
 func (c *Client) makeRequestWithRetry(ctx context.Context, method, path string, queryParams map[string]string) ([]byte, error) {
-	var lastErr error
-	var body []byte
+	var respBody []byte
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Apply exponential backoff with jitter for retries
-		if attempt > 0 {
-			backoffTime := time.Duration(1<<uint(attempt-1)) * time.Second
-			// Add some jitter - between 75% and 100% of calculated backoff
-			backoffTime = time.Duration(float64(backoffTime) * (0.75 + 0.25*rand.Float64()))
+	// Define backoff policy for retries
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.MaxElapsedTime = 30 * time.Second
 
-			timer := time.NewTimer(backoffTime)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return nil, ctx.Err()
-			case <-timer.C:
-				// Continue with retry
-			}
-		}
-
-		// Create a separate context with shorter timeout just for the rate limiter
-		limiterCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := c.rateLimiter.Wait(limiterCtx)
-		cancel()
-
+	operation := func() error {
+		req, err := c.createRequest(ctx, method, path, queryParams) // Use queryParams here!
 		if err != nil {
-			// Log but continue - we'll be naturally rate limited by the API
-			c.logger.Debug("Rate limiter wait skipped, proceeding with caution",
-				"path", path,
-				"error", err)
+			return backoff.Permanent(fmt.Errorf("failed to create request: %w", err))
 		}
 
-		// Create request and execute
-		req, err := c.createRequest(ctx, method, path, queryParams)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
+		start := time.Now()
 		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = err
-			c.logger.Debug("Request failed, will retry",
-				"attempt", attempt+1,
-				"max_retries", maxRetries,
-				"error", err)
-
-			if !isRetryableError(err) || attempt+1 >= maxRetries {
-				break
-			}
-			continue
-		}
-
-		// Read body
-		body, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
+		requestDuration := time.Since(start)
 
 		if err != nil {
-			lastErr = fmt.Errorf("failed to read response body: %w", err)
-			c.logger.Debug("Failed to read response body",
-				"attempt", attempt+1,
+			// Network errors are generally retryable
+			c.logger.Warn("Request failed",
+				"method", method,
+				"path", path,
+				"duration_ms", requestDuration.Milliseconds(),
 				"error", err)
-			continue
+			return err
+		}
+		defer resp.Body.Close()
+
+		respBody, err = io.ReadAll(resp.Body)
+		if err != nil {
+			c.logger.Error("Failed to read response body",
+				"method", method,
+				"path", path,
+				"status", resp.StatusCode,
+				"error", err)
+			return backoff.Permanent(fmt.Errorf("failed to read response: %w", err))
 		}
 
-		// Update rate limiter with headers (if it's our adaptive limiter)
-		if adaptiveLimiter, ok := c.rateLimiter.(interface{ UpdateFromResponse(*http.Response) }); ok {
-			adaptiveLimiter.UpdateFromResponse(resp)
-		}
+		// Log the response details
+		c.logger.Debug("API response",
+			"method", method,
+			"path", path,
+			"status", resp.StatusCode,
+			"duration_ms", requestDuration.Milliseconds(),
+			"body_size_bytes", len(respBody))
 
 		// Check status code
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("API returned non-200 status: %d, body: %s", resp.StatusCode, string(body))
-
-			// Handle rate limiting specifically
-			if resp.StatusCode == http.StatusTooManyRequests {
-				c.logger.Warn("Rate limited by API, backing off",
-					"attempt", attempt+1,
-					"path", path)
-
-				// Extract retry-after header if present
-				retryAfter := resp.Header.Get("Retry-After")
-				if retryAfter != "" {
-					if seconds, err := strconv.Atoi(retryAfter); err == nil {
-						waitDuration := time.Duration(seconds) * time.Second
-						timer := time.NewTimer(waitDuration)
-						select {
-						case <-ctx.Done():
-							timer.Stop()
-							return nil, ctx.Err()
-						case <-timer.C:
-							// Continue after waiting
-						}
-					}
-				}
-
-				if attempt+1 < maxRetries {
-					continue
-				}
-			}
-
-			// For server errors, retry
-			if resp.StatusCode >= 500 && resp.StatusCode < 600 && attempt+1 < maxRetries {
-				continue
-			}
-
-			return nil, lastErr
+		if resp.StatusCode == http.StatusTooManyRequests {
+			c.logger.Warn("Rate limit exceeded",
+				"method", method,
+				"path", path,
+				"status", resp.StatusCode)
+			return fmt.Errorf("rate limit exceeded (429): %s", string(respBody))
 		}
 
-		// If we get here, the request was successful
-		return body, nil
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			c.logger.Error("API returned error status",
+				"method", method,
+				"path", path,
+				"status", resp.StatusCode,
+				"response", string(respBody))
+			return backoff.Permanent(fmt.Errorf("api error status %d: %s", resp.StatusCode, string(respBody)))
+		}
+
+		return nil
 	}
 
-	return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries, lastErr)
+	err := backoff.Retry(operation, expBackoff)
+	if err != nil {
+		return nil, err
+	}
+
+	return respBody, nil
 }
 
 // Helper to determine if an error is retryable

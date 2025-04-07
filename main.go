@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,44 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/viper"
 )
+
+var (
+	version   = "1.0.0"   // Example version, replace with actual version
+	buildTime = "unknown" // Example build time, replace with actual build time
+)
+
+func registerBuildInfo(logger *slog.Logger) {
+	buildInfo := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "confluent_cloud_exporter_build_info",
+			Help: "Build information about the exporter",
+		},
+		[]string{"version", "go_version", "built_at"},
+	)
+	buildInfo.WithLabelValues(version, runtime.Version(), buildTime).Set(1)
+	prometheus.MustRegister(buildInfo)
+	logger.Debug("Registered build information metrics")
+}
+
+func setupLogger(level string) *slog.Logger {
+	var logLevelVar slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		logLevelVar = slog.LevelDebug
+	case "info":
+		logLevelVar = slog.LevelInfo
+	case "warn":
+		logLevelVar = slog.LevelWarn
+	case "error":
+		logLevelVar = slog.LevelError
+	default:
+		logLevelVar = slog.LevelInfo
+	}
+
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevelVar,
+	}))
+}
 
 func main() {
 	// Define command line flags
@@ -71,23 +110,7 @@ func main() {
 	}
 
 	// Configure structured logger
-	var logLevelVar slog.Level
-	switch strings.ToLower(cfg.LogLevel) {
-	case "debug":
-		logLevelVar = slog.LevelDebug
-	case "info":
-		logLevelVar = slog.LevelInfo
-	case "warn":
-		logLevelVar = slog.LevelWarn
-	case "error":
-		logLevelVar = slog.LevelError
-	default:
-		logLevelVar = slog.LevelInfo
-	}
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevelVar,
-	}))
+	logger := setupLogger(cfg.LogLevel)
 
 	// Log effective configuration (excluding secrets)
 	logger.Info("Starting Confluent Cloud Exporter",
@@ -98,6 +121,9 @@ func main() {
 		"targetEnvironmentIDs", cfg.TargetEnvironmentIDs,
 		"apiKeyConfigured", cfg.ConfluentAPIKey != "",
 	)
+
+	// Register build information metrics
+	registerBuildInfo(logger)
 
 	// Create a shared rate limiter for all Confluent API clients
 	// 1 request per second with burst of 5
@@ -117,6 +143,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Make initial discovery more critical
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	if err := discoveryService.RefreshResources(ctx); err != nil {
+		logger.Error("Initial resource discovery failed, exporter cannot function", "error", err)
+		os.Exit(1)
+	}
+	cancel()
+
 	// Create clients with the limiter
 	metricsClient := metrics.NewClient(cfg.ConfluentAPIKey, cfg.ConfluentAPISecret, metricsLimiter)
 	metricsClient.SetLogger(logger)
@@ -131,26 +165,16 @@ func main() {
 
 	// Start background resource discovery
 	go func() {
-		// Initial discovery
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		if err := confluentCollector.RefreshResourcesAsync(ctx); err != nil {
-			logger.Error("Initial resource discovery failed", "error", err)
-		}
-		cancel()
-
 		// Set up ticker for periodic updates
 		ticker := time.NewTicker(cfg.DiscoveryInterval)
 		defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-				if err := confluentCollector.RefreshResourcesAsync(ctx); err != nil {
-					logger.Error("Background resource discovery failed", "error", err)
-				}
-				cancel()
+		for range ticker.C {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			if err := confluentCollector.RefreshResourcesAsync(ctx); err != nil {
+				logger.Error("Background resource discovery failed", "error", err)
 			}
+			cancel()
 		}
 	}()
 

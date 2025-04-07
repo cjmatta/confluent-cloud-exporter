@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,12 +30,18 @@ const (
 	maxRetries         = 3 // Add retry constant
 )
 
+// RateLimiter defines the interface for rate limiters
+type RateLimiter interface {
+	Wait(ctx context.Context) error
+}
+
 // Client represents a Confluent Cloud API client
 type Client struct {
-	httpClient *http.Client
-	apiKey     string
-	apiSecret  string
-	logger     *slog.Logger
+	httpClient  *http.Client
+	apiKey      string
+	apiSecret   string
+	logger      *slog.Logger
+	rateLimiter RateLimiter
 }
 
 // Environment represents a Confluent Cloud environment
@@ -184,20 +192,22 @@ type ComputePoolsResponse struct {
 
 // Connector represents a connector
 type Connector struct {
-	ID   string `json:"id,omitempty"`
-	Name string `json:"name"`
-	Type string `json:"type,omitempty"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Class string `json:"class"`
 }
 
 // NewClient creates a new Confluent Cloud API client
-func NewClient(apiKey, apiSecret string) *Client {
+func NewClient(apiKey, apiSecret string, rateLimiter RateLimiter) *Client {
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
 		},
-		apiKey:    apiKey,
-		apiSecret: apiSecret,
-		logger:    slog.Default(),
+		apiKey:      apiKey,
+		apiSecret:   apiSecret,
+		logger:      slog.Default(),
+		rateLimiter: rateLimiter,
 	}
 }
 
@@ -206,8 +216,8 @@ func (c *Client) SetLogger(logger *slog.Logger) {
 	c.logger = logger
 }
 
-// makeRequest performs an HTTP request and returns the response body
-func (c *Client) makeRequest(ctx context.Context, method, path string, queryParams map[string]string) ([]byte, error) {
+// createRequest creates an HTTP request with appropriate headers and auth
+func (c *Client) createRequest(ctx context.Context, method, path string, queryParams map[string]string) (*http.Request, error) {
 	// Build URL with query parameters
 	reqURL, err := url.Parse(baseURL + path)
 	if err != nil {
@@ -228,90 +238,121 @@ func (c *Client) makeRequest(ctx context.Context, method, path string, queryPara
 	}
 
 	req.SetBasicAuth(c.apiKey, c.apiSecret)
-
-	// Execute request
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Check status code
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned non-200 status: %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	return body, nil
+	return req, nil
 }
 
 // makeRequestWithRetry performs an HTTP request with retries and backoff
 func (c *Client) makeRequestWithRetry(ctx context.Context, method, path string, queryParams map[string]string) ([]byte, error) {
 	var lastErr error
+	var body []byte
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// If not the first attempt, add a backoff delay
+		// Apply exponential backoff with jitter for retries
 		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s...
 			backoffTime := time.Duration(1<<uint(attempt-1)) * time.Second
-			c.logger.Debug("Retrying request after backoff",
-				"attempt", attempt+1,
-				"max_attempts", maxRetries,
-				"backoff_time", backoffTime.String(),
-				"path", path)
+			// Add some jitter - between 75% and 100% of calculated backoff
+			backoffTime = time.Duration(float64(backoffTime) * (0.75 + 0.25*rand.Float64()))
 
-			// Create a timer for the backoff
 			timer := time.NewTimer(backoffTime)
-
-			// Wait for either the backoff timer or context cancellation
 			select {
-			case <-timer.C:
-				// Backoff completed, continue with retry
 			case <-ctx.Done():
-				// Context was canceled during backoff
 				timer.Stop()
 				return nil, ctx.Err()
+			case <-timer.C:
+				// Continue with retry
 			}
 		}
 
-		// Create a child context with a timeout for this specific request
-		reqCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
-
-		// Make the request with the child context
-		body, err := c.makeRequest(reqCtx, method, path, queryParams)
-
-		// Always cancel the child context to prevent resource leaks
+		// Create a separate context with shorter timeout just for the rate limiter
+		limiterCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := c.rateLimiter.Wait(limiterCtx)
 		cancel()
 
-		// If successful, return the result
-		if err == nil {
-			return body, nil
+		if err != nil {
+			// Log but continue - we'll be naturally rate limited by the API
+			c.logger.Debug("Rate limiter wait skipped, proceeding with caution",
+				"path", path,
+				"error", err)
 		}
 
-		// Log the error
-		c.logger.Debug("Request failed, may retry",
-			"attempt", attempt+1,
-			"max_attempts", maxRetries,
-			"path", path,
-			"error", err)
-
-		// Save the error for potential return
-		lastErr = err
-
-		// Don't retry if context is already canceled
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		// Create request and execute
+		req, err := c.createRequest(ctx, method, path, queryParams)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 
-		// Don't retry certain errors
-		if !isRetryableError(err) {
-			return nil, err
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			c.logger.Debug("Request failed, will retry",
+				"attempt", attempt+1,
+				"max_retries", maxRetries,
+				"error", err)
+
+			if !isRetryableError(err) || attempt+1 >= maxRetries {
+				break
+			}
+			continue
 		}
+
+		// Read body
+		body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			c.logger.Debug("Failed to read response body",
+				"attempt", attempt+1,
+				"error", err)
+			continue
+		}
+
+		// Update rate limiter with headers (if it's our adaptive limiter)
+		if adaptiveLimiter, ok := c.rateLimiter.(interface{ UpdateFromResponse(*http.Response) }); ok {
+			adaptiveLimiter.UpdateFromResponse(resp)
+		}
+
+		// Check status code
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("API returned non-200 status: %d, body: %s", resp.StatusCode, string(body))
+
+			// Handle rate limiting specifically
+			if resp.StatusCode == http.StatusTooManyRequests {
+				c.logger.Warn("Rate limited by API, backing off",
+					"attempt", attempt+1,
+					"path", path)
+
+				// Extract retry-after header if present
+				retryAfter := resp.Header.Get("Retry-After")
+				if retryAfter != "" {
+					if seconds, err := strconv.Atoi(retryAfter); err == nil {
+						waitDuration := time.Duration(seconds) * time.Second
+						timer := time.NewTimer(waitDuration)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return nil, ctx.Err()
+						case <-timer.C:
+							// Continue after waiting
+						}
+					}
+				}
+
+				if attempt+1 < maxRetries {
+					continue
+				}
+			}
+
+			// For server errors, retry
+			if resp.StatusCode >= 500 && resp.StatusCode < 600 && attempt+1 < maxRetries {
+				continue
+			}
+
+			return nil, lastErr
+		}
+
+		// If we get here, the request was successful
+		return body, nil
 	}
 
 	return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries, lastErr)
@@ -437,20 +478,6 @@ func (c *Client) GetSchemaRegistries(ctx context.Context, envID string) ([]Schem
 			return nil, fmt.Errorf("failed to get Schema Registry instances: %w", err)
 		}
 
-		// Also check specifically the structure of the 'region' field
-		var rawResponse map[string]interface{}
-		if err := json.Unmarshal(body, &rawResponse); err == nil {
-			if data, ok := rawResponse["data"].([]interface{}); ok && len(data) > 0 {
-				if item, ok := data[0].(map[string]interface{}); ok {
-					if spec, ok := item["spec"].(map[string]interface{}); ok {
-						c.logger.Debug("Schema Registry region field structure",
-							"region_type", fmt.Sprintf("%T", spec["region"]),
-							"region_value", fmt.Sprintf("%v", spec["region"]))
-					}
-				}
-			}
-		}
-
 		var resp SchemaRegistryResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
 			return nil, fmt.Errorf("failed to parse Schema Registry response: %w", err)
@@ -540,34 +567,72 @@ func (c *Client) GetComputePools(ctx context.Context, envID string) ([]ComputePo
 	return allComputePools, nil
 }
 
-// GetConnectors retrieves connectors for a specific environment and cluster
+// GetConnectors retrieves connectors with their internal IDs for a specific environment and cluster
 func (c *Client) GetConnectors(ctx context.Context, envID, clusterID string) ([]Connector, error) {
-	path := fmt.Sprintf(connectorsBasePath, envID, clusterID)
+	// Add expand parameter to get detailed info including IDs
+	path := fmt.Sprintf(connectorsBasePath+"?expand=info,status,id", envID, clusterID)
 
 	body, err := c.makeRequestWithRetry(ctx, "GET", path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connectors: %w", err)
 	}
 
-	// The connector API returns a different format - just a list of connector names
-	var connectorNames []string
-	if err := json.Unmarshal(body, &connectorNames); err != nil {
+	// The detailed API response is a map of connector names to connector details
+	var connectorsDetails map[string]struct {
+		ID struct {
+			ID     string `json:"id"`
+			IDType string `json:"id_type"`
+		} `json:"id"`
+		Info struct {
+			Name   string `json:"name"`
+			Type   string `json:"type"` // "sink" or "source"
+			Config struct {
+				ConnectorClass string `json:"connector.class"`
+			} `json:"config"`
+		} `json:"info"`
+	}
+
+	if err := json.Unmarshal(body, &connectorsDetails); err != nil {
+		// If unmarshal fails, try the old format (just names)
+		var connectorNames []string
+		if err2 := json.Unmarshal(body, &connectorNames); err2 == nil {
+			// Fall back to the old behavior
+			c.logger.Debug("API returned simple connector names, no internal IDs available")
+
+			connectors := make([]Connector, len(connectorNames))
+			for i, name := range connectorNames {
+				connectors[i] = Connector{
+					Name: name,
+					ID:   name, // Use name as ID
+				}
+			}
+
+			return connectors, nil
+		}
+
+		// Both unmarshaling attempts failed
 		return nil, fmt.Errorf("failed to parse connectors response: %w", err)
 	}
 
-	// Convert connector names to Connector objects
-	connectors := make([]Connector, len(connectorNames))
-	for i, name := range connectorNames {
-		connectors[i] = Connector{
-			Name: name,
-			ID:   name, // Use name as ID if no separate ID is available
+	// Convert the detailed response to Connector objects with internal IDs
+	connectors := make([]Connector, 0, len(connectorsDetails))
+	for name, details := range connectorsDetails {
+		id := name // Default to using name as ID
+
+		// Use internal ID if available
+		if details.ID.ID != "" {
+			id = details.ID.ID
+			c.logger.Debug("Using internal connector ID", "name", name, "id", id)
 		}
 
-		// Try to determine connector type from name (a common pattern is "type-name")
-		parts := strings.SplitN(name, "-", 2)
-		if len(parts) > 1 {
-			connectors[i].Type = parts[0]
+		connector := Connector{
+			Name:  name,
+			ID:    id,
+			Type:  details.Info.Type,                  // "sink" or "source"
+			Class: details.Info.Config.ConnectorClass, // Actual connector class
 		}
+
+		connectors = append(connectors, connector)
 	}
 
 	return connectors, nil
@@ -622,7 +687,7 @@ func (c *Client) GetAllResources(ctx context.Context, targetEnvIDs []string) ([]
 	// Create an error group for controlled parallelism
 	g, gctx := errgroup.WithContext(ctx)
 	// Limit concurrency to avoid overwhelming the API
-	semaphore := make(chan struct{}, 5) // Limit to 5 concurrent requests per environment
+	semaphore := make(chan struct{}, 3) // Limit to 3 concurrent requests per environment
 
 	// Process each environment
 	for _, env := range filteredEnvs {

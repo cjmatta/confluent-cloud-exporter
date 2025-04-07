@@ -38,9 +38,9 @@ type DiscoveryService struct {
 }
 
 // NewDiscoveryService creates a new discovery service
-func NewDiscoveryService(apiKey, apiSecret string, targetEnvIDs []string, logger *slog.Logger) (*DiscoveryService, error) {
+func NewDiscoveryService(apiKey, apiSecret string, targetEnvIDs []string, logger *slog.Logger, rateLimiter *confluent.AdaptiveRateLimiter) (*DiscoveryService, error) {
 	// Create Confluent client
-	client := confluent.NewClient(apiKey, apiSecret)
+	client := confluent.NewClient(apiKey, apiSecret, rateLimiter)
 	client.SetLogger(logger)
 
 	return &DiscoveryService{

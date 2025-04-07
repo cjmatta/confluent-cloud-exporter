@@ -15,6 +15,7 @@ import (
 
 	"confluent-cloud-exporter/collector"
 	"confluent-cloud-exporter/config"
+	"confluent-cloud-exporter/confluent"
 	"confluent-cloud-exporter/discovery"
 	"confluent-cloud-exporter/metrics"
 
@@ -98,8 +99,10 @@ func main() {
 		"apiKeyConfigured", cfg.ConfluentAPIKey != "",
 	)
 
-	// Create metrics descriptors
-	metricDescriptors := metrics.NewMetricsDescriptors()
+	// Create a shared rate limiter for all Confluent API clients
+	// 1 request per second with burst of 5
+	discoveryLimiter := confluent.NewAdaptiveRateLimiter(2, 10) // Start with 2 rps, burst 10
+	metricsLimiter := confluent.NewAdaptiveRateLimiter(1, 5)    // Start with 1 rps, burst 5
 
 	// Create the discovery service
 	discoveryService, err := discovery.NewDiscoveryService(
@@ -107,59 +110,52 @@ func main() {
 		cfg.ConfluentAPISecret,
 		cfg.TargetEnvironmentIDs,
 		logger,
+		discoveryLimiter,
 	)
 	if err != nil {
 		logger.Error("Failed to create discovery service", "error", err)
 		os.Exit(1)
 	}
 
-	// Perform initial discovery (synchronously)
-	logger.Info("Running initial resource discovery")
-	discoveryCtx, discoveryCancel := context.WithTimeout(context.Background(), 3*time.Minute) // Use 3 minutes instead of 30 seconds
-	defer discoveryCancel()
+	// Create clients with the limiter
+	metricsClient := metrics.NewClient(cfg.ConfluentAPIKey, cfg.ConfluentAPISecret, metricsLimiter)
+	metricsClient.SetLogger(logger)
 
-	if err := discoveryService.RefreshResources(discoveryCtx); err != nil {
-		logger.Error("Initial resource discovery failed", "error", err)
-		// Continue starting up - we'll retry discovery in the background
-	} else {
-		resources := discoveryService.GetResources()
-		logger.Info("Initial resource discovery completed", "resources_found", len(resources))
-	}
+	// Create the collector with the discovery service
+	confluentCollector := collector.NewCollector(
+		discoveryService,
+		metricsClient,
+		cfg.MetricsCacheDuration,
+	)
+	confluentCollector.SetLogger(logger)
 
-	// Create a context for graceful shutdown
-	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
-	defer shutdownCancel()
-
-	// Start periodic discovery refresh in background
+	// Start background resource discovery
 	go func() {
+		// Initial discovery
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		if err := confluentCollector.RefreshResourcesAsync(ctx); err != nil {
+			logger.Error("Initial resource discovery failed", "error", err)
+		}
+		cancel()
+
+		// Set up ticker for periodic updates
 		ticker := time.NewTicker(cfg.DiscoveryInterval)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ticker.C:
-				logger.Debug("Running periodic resource discovery")
-				// Use a longer timeout for the refresh
-				refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-
-				if err := discoveryService.RefreshResources(refreshCtx); err != nil {
-					logger.Error("Periodic resource discovery failed", "error", err)
-				} else {
-					resources := discoveryService.GetResources()
-					logger.Info("Periodic resource discovery completed", "resources_found", len(resources))
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				if err := confluentCollector.RefreshResourcesAsync(ctx); err != nil {
+					logger.Error("Background resource discovery failed", "error", err)
 				}
-
-				refreshCancel()
-			case <-shutdownCtx.Done():
-				logger.Info("Stopping periodic resource discovery")
-				return
+				cancel()
 			}
 		}
 	}()
 
-	// Create and register the collector
-	confluent := collector.NewCollector(cfg, discoveryService, metricDescriptors, logger)
-	prometheus.MustRegister(confluent)
+	// Register the collector with Prometheus
+	prometheus.MustRegister(confluentCollector)
 
 	// Register Prometheus metrics handler
 	http.Handle("/metrics", promhttp.Handler())
@@ -193,11 +189,8 @@ func main() {
 	logger.Info("Received signal, shutting down", "signal", sig)
 
 	// Trigger shutdown
-	shutdownCancel()
-
-	// Shutdown HTTP server gracefully
-	shutdownCtx, serverShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer serverShutdownCancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server shutdown error", "error", err)

@@ -10,6 +10,12 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// ResponseAwareRateLimiter extends RateLimiter with the ability to adapt based on HTTP responses
+type ResponseAwareRateLimiter interface {
+	RateLimiter
+	UpdateFromResponse(resp *http.Response)
+}
+
 // AdaptiveRateLimiter implements a rate limiter that adjusts based on Confluent API responses
 type AdaptiveRateLimiter struct {
 	// Base limiter (fallback when no header info)

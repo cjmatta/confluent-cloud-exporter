@@ -249,9 +249,16 @@ func (c *Client) makeRequestWithRetry(ctx context.Context, method, path string, 
 	expBackoff.MaxElapsedTime = 30 * time.Second
 
 	operation := func() error {
-		req, err := c.createRequest(ctx, method, path, queryParams) // Use queryParams here!
+		req, err := c.createRequest(ctx, method, path, queryParams)
 		if err != nil {
 			return backoff.Permanent(fmt.Errorf("failed to create request: %w", err))
+		}
+
+		// Wait for rate limiter before sending request
+		if c.rateLimiter != nil {
+			if err := c.rateLimiter.Wait(ctx); err != nil {
+				return backoff.Permanent(fmt.Errorf("rate limiter wait failed: %w", err))
+			}
 		}
 
 		start := time.Now()
@@ -268,6 +275,13 @@ func (c *Client) makeRequestWithRetry(ctx context.Context, method, path string, 
 			return err
 		}
 		defer resp.Body.Close()
+
+		// Update rate limiter with response headers
+		if c.rateLimiter != nil {
+			if adaptiveLimiter, ok := c.rateLimiter.(*AdaptiveRateLimiter); ok {
+				adaptiveLimiter.UpdateFromResponse(resp)
+			}
+		}
 
 		respBody, err = io.ReadAll(resp.Body)
 		if err != nil {

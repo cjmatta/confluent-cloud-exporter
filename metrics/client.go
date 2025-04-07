@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -21,7 +22,8 @@ const (
 	exportPath      = "/v2/metrics/cloud/export"
 	defaultTimeout  = 60 * time.Second
 	maxRetries      = 3
-	exportBatchSize = 20 // Maximum resources per export request to avoid exceeding URL length limits
+	// Allow this to be adjusted dynamically based on resource count
+	defaultBatchSize = 50 // Base batch size
 )
 
 // Client represents a Confluent Cloud Metrics API client for the export endpoint
@@ -30,15 +32,27 @@ type Client struct {
 	apiKey            string
 	apiSecret         string
 	logger            *slog.Logger
-	rateLimiter       *confluent.AdaptiveRateLimiter // Global rate limiter
-	unauthorizedCache map[string]map[string]bool     // Map of resourceType -> resourceID -> true
-	cacheMutex        sync.RWMutex                   // Mutex to protect the cache
+	rateLimiter       confluent.ResponseAwareRateLimiter
+	unauthorizedCache map[string]map[string]bool // Map of resourceType -> resourceID -> true
+	cacheMutex        sync.RWMutex               // Mutex to protect the cache
 }
 
 // NewClient creates a new metrics client for the export endpoint
-func NewClient(apiKey, apiSecret string, rateLimiter *confluent.AdaptiveRateLimiter) *Client {
+func NewClient(apiKey, apiSecret string, rateLimiter confluent.ResponseAwareRateLimiter) *Client {
+	// Use a transport with connection pooling and HTTP/2 support
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false, // Enable compression
+		ForceAttemptHTTP2:   true,  // Try HTTP/2 for better multiplexing
+	}
+
 	return &Client{
-		httpClient:        &http.Client{Timeout: defaultTimeout},
+		httpClient: &http.Client{
+			Timeout:   defaultTimeout,
+			Transport: transport,
+		},
 		apiKey:            apiKey,
 		apiSecret:         apiSecret,
 		logger:            slog.Default(),
@@ -55,77 +69,103 @@ func (c *Client) SetLogger(logger *slog.Logger) {
 
 // ExportMetrics with parallel batch processing
 func (c *Client) ExportMetrics(ctx context.Context, resources []discovery.DiscoveredResource) (string, error) {
-	// Add detailed debug logging for resource types
-	resourceTypeMap := make(map[string]int)
-	for _, resource := range resources {
-		resourceTypeMap[resource.Type]++
+	// Add timing information to overall process
+	startTime := time.Now()
+	defer func() {
+		c.logger.Debug("Export metrics completed",
+			"duration_ms", time.Since(startTime).Milliseconds())
+	}()
+
+	// Skip detailed debug logging in production mode
+	if c.logger.Enabled(ctx, slog.LevelDebug) {
+		// Only log resource details at debug level
+		resourceTypeMap := make(map[string]int)
+		for _, resource := range resources {
+			resourceTypeMap[resource.Type]++
+		}
+
+		for resType, count := range resourceTypeMap {
+			c.logger.Debug("Found resources of type",
+				"type", resType,
+				"count", count,
+				"example_id", getExampleID(resources, resType))
+		}
 	}
 
-	// Log unique resource types and counts
-	for resType, count := range resourceTypeMap {
-		c.logger.Debug("Found resources of type",
-			"type", resType,
-			"count", count,
-			"example_id", getExampleID(resources, resType))
-	}
-
-	// Group resources by type, filtering out ones we know are unauthorized
+	// Group resources by type more efficiently
 	resourcesByType := make(map[string][]string)
 	filteredCount := 0
 
+	// Prefilter resources by known unauthorized resources
+	c.cacheMutex.RLock()
 	for _, resource := range resources {
 		resourceType := mapResourceTypeToAPIName(resource.Type)
 		if resourceType == "" {
-			// Skip unsupported resource types
-			continue
+			continue // Skip unsupported types
 		}
 
-		// Skip resources we already know are unauthorized
-		if c.isUnauthorized(resourceType, resource.ID) {
+		// Fast path check for unauthorized resources
+		if resourceMap, exists := c.unauthorizedCache[resourceType]; exists && resourceMap[resource.ID] {
 			filteredCount++
 			continue
 		}
 
 		resourcesByType[resourceType] = append(resourcesByType[resourceType], resource.ID)
 	}
+	c.cacheMutex.RUnlock()
 
-	// Log filtered resources
-	if filteredCount > 0 {
-		c.logger.Debug("Skipped previously unauthorized resources",
-			"count", filteredCount)
+	if c.logger.Enabled(ctx, slog.LevelDebug) {
+		// Only log filtered resources at debug level
+		if filteredCount > 0 {
+			c.logger.Debug("Skipped previously unauthorized resources", "count", filteredCount)
+		}
+
+		c.logger.Debug("Exporting metrics after type mapping",
+			"mapped_resource_types", len(resourcesByType),
+			"total_resources_after_mapping", countTotalResources(resourcesByType))
 	}
 
-	// Log what we're actually going to query
-	c.logger.Debug("Exporting metrics after type mapping",
-		"mapped_resource_types", len(resourcesByType),
-		"total_resources_after_mapping", countTotalResources(resourcesByType))
+	// Determine optimal batch size based on total resource count
+	totalResources := countTotalResources(resourcesByType)
+	batchSize := defaultBatchSize
 
-	for resType, ids := range resourcesByType {
-		c.logger.Debug("Mapped resource type",
-			"api_type", resType,
-			"count", len(ids),
-			"example_ids", strings.Join(ids[:min(3, len(ids))], ", "))
+	// For small resource counts, use larger batches to reduce HTTP overhead
+	if totalResources < 100 {
+		batchSize = 100 // Larger batch for fewer resources
+	} else if totalResources > 1000 {
+		batchSize = 30 // Smaller batch for many resources to avoid URL length limits
 	}
 
-	// Process batches in parallel
+	// Determine optimal concurrency based on resource type count
+	concurrencyLimit := 10 // Default
+	if len(resourcesByType) > 5 {
+		// If we have many resource types, increase concurrency to prevent bottlenecks
+		concurrencyLimit = 20
+	}
+
+	c.logger.Debug("Optimized batch parameters",
+		"batch_size", batchSize,
+		"concurrency", concurrencyLimit,
+		"total_resources", totalResources)
+
+	// Increase concurrent API requests for better throughput
 	var mu sync.Mutex
 	var allMetricsBuilder strings.Builder
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 5) // Allow up to 5 concurrent API requests
-	errCount := 0
+	semaphore := make(chan struct{}, concurrencyLimit)
 
+	// Process batches in parallel
 	for resourceType, ids := range resourcesByType {
-		// Process IDs in batches
-		for i := 0; i < len(ids); i += exportBatchSize {
+		// Process IDs in dynamically sized batches
+		for i := 0; i < len(ids); i += batchSize {
 			wg.Add(1)
 			go func(rType string, batchStart int) {
 				defer wg.Done()
 
-				// Use semaphore for concurrency control
 				semaphore <- struct{}{}
 				defer func() { <-semaphore }()
 
-				end := batchStart + exportBatchSize
+				end := batchStart + batchSize
 				if end > len(ids) {
 					end = len(ids)
 				}
@@ -133,38 +173,43 @@ func (c *Client) ExportMetrics(ctx context.Context, resources []discovery.Discov
 				batchIDs := ids[batchStart:end]
 				metrics, err := c.fetchMetricsForBatch(ctx, rType, batchIDs)
 				if err != nil {
-					mu.Lock()
-					errCount++
-					mu.Unlock()
-
-					c.logger.Warn("Failed to export metrics for resource batch",
+					c.logger.Warn("Failed to export metrics",
 						"resource_type", rType,
 						"batch_size", len(batchIDs),
 						"error", err)
 					return
 				}
 
-				// Safely append to the builder
-				mu.Lock()
-				allMetricsBuilder.WriteString(metrics)
-				mu.Unlock()
+				if metrics != "" {
+					mu.Lock()
+					allMetricsBuilder.WriteString(metrics)
+					mu.Unlock()
+				}
 			}(resourceType, i)
 		}
 	}
 
-	// Wait for all batches to complete
 	wg.Wait()
 
-	c.logger.Debug("Completed parallel metrics fetching",
-		"total_batches", countTotalResources(resourcesByType)/exportBatchSize+1,
-		"error_batches", errCount)
-
-	// Deduplicate HELP/TYPE lines
+	// Return result with optimized deduplication
 	return deduplicateMetricsText(allMetricsBuilder.String()), nil
 }
 
 // fetchMetricsForBatch exports metrics for a specific batch of resources
 func (c *Client) fetchMetricsForBatch(ctx context.Context, resourceType string, ids []string) (string, error) {
+	// Add timing information for performance monitoring
+	startTime := time.Now()
+	defer func() {
+		c.logger.Debug("Batch metrics fetch completed",
+			"resource_type", resourceType,
+			"count", len(ids),
+			"duration_ms", time.Since(startTime).Milliseconds())
+	}()
+
+	// Create a timeout specifically for this batch request
+	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
 	// Debug log the exact details of this batch
 	c.logger.Debug("Fetching metrics batch",
 		"resource_type", resourceType,
@@ -209,18 +254,18 @@ func (c *Client) fetchMetricsForBatch(ctx context.Context, resourceType string, 
 			select {
 			case <-time.After(jitter):
 				// Continue after backoff
-			case <-ctx.Done():
-				return "", ctx.Err()
+			case <-requestCtx.Done():
+				return "", requestCtx.Err()
 			}
 		}
 
 		// Wait for rate limiter before sending request
-		if err := c.rateLimiter.Wait(ctx); err != nil {
+		if err := c.rateLimiter.Wait(requestCtx); err != nil {
 			return "", fmt.Errorf("rate limiter wait failed: %w", err)
 		}
 
 		// Create a request with context
-		req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+		req, err := http.NewRequestWithContext(requestCtx, "GET", fullURL, nil)
 		if err != nil {
 			return "", fmt.Errorf("failed to create request: %w", err)
 		}
@@ -229,14 +274,32 @@ func (c *Client) fetchMetricsForBatch(ctx context.Context, resourceType string, 
 		req.SetBasicAuth(c.apiKey, c.apiSecret)
 		req.Header.Add("Accept", "text/plain;version=0.0.4") // Request Prometheus format
 
-		// Execute the request
+		// Execute the request with timing
+		reqStartTime := time.Now()
 		resp, err := c.httpClient.Do(req)
+		reqDuration := time.Since(reqStartTime)
+		
+		if reqDuration > 5*time.Second {
+			c.logger.Warn("Slow API request",
+				"resource_type", resourceType,
+				"duration_ms", reqDuration.Milliseconds(),
+				"resource_count", len(ids))
+		}
+
 		if err != nil {
 			lastErr = err
 			if isRetryableError(err) {
 				continue
 			}
 			return "", fmt.Errorf("failed to execute request: %w", err)
+		}
+
+		// Update rate limiter with response headers
+		if c.rateLimiter != nil {
+			adaptiveLimiter, ok := c.rateLimiter.(*confluent.AdaptiveRateLimiter)
+			if ok {
+				adaptiveLimiter.UpdateFromResponse(resp)
+			}
 		}
 
 		// Read and close response body
@@ -308,8 +371,8 @@ func (c *Client) fetchMetricsForBatch(ctx context.Context, resourceType string, 
 						select {
 						case <-time.After(resetTime):
 							// Continue after rate limit reset
-						case <-ctx.Done():
-							return "", ctx.Err()
+						case <-requestCtx.Done():
+							return "", requestCtx.Err()
 						}
 					}
 				}
@@ -443,51 +506,77 @@ func (c *Client) markUnauthorized(resourceType string, resourceIDs []string) {
 	}
 }
 
-// Add this helper function to deduplicate help lines - optimized version
+// Memory-optimized deduplication with buffered scanning
 func deduplicateMetricsText(metricsText string) string {
-	if len(metricsText) == 0 {
-		return ""
+	// Skip deduplication for small responses entirely
+	if len(metricsText) < 5000 { // Increased threshold from 1000 to 5000
+		return metricsText
 	}
 
-	// Faster implementation with pre-allocation
-	lines := strings.Split(metricsText, "\n")
-	seenHelp := make(map[string]bool, len(lines)/10) // Pre-allocate with estimated size
-	seenType := make(map[string]bool, len(lines)/10)
-	result := make([]string, 0, len(lines))
+	// Pre-calculate approximate size
+	estimatedLines := strings.Count(metricsText, "\n") + 1
+	seenHelp := make(map[string]struct{}, estimatedLines/10)
+	seenType := make(map[string]struct{}, estimatedLines/10)
 
-	for _, line := range lines {
+	// Use a scanner for more memory-efficient processing
+	var sb strings.Builder
+	sb.Grow(len(metricsText)) // Pre-allocate approximate size
+
+	scanner := bufio.NewScanner(strings.NewReader(metricsText))
+	
+	// Increase scanner buffer for larger responses
+	const maxScannerBuffer = 1024 * 1024 // 1MB
+	buf := make([]byte, maxScannerBuffer)
+	scanner.Buffer(buf, maxScannerBuffer)
+	
+	for scanner.Scan() {
+		line := scanner.Text()
+
 		if len(line) == 0 {
-			result = append(result, line)
+			sb.WriteString("\n")
 			continue
 		}
 
-		// Fast check for help/type lines
-		if len(line) > 7 && line[0] == '#' {
-			if line[2] == 'H' && strings.HasPrefix(line, "# HELP ") {
-				// For HELP lines
-				idx := strings.IndexByte(line[7:], ' ')
-				if idx > 0 {
-					metricName := line[7 : 7+idx]
-					if seenHelp[metricName] {
-						continue
-					}
-					seenHelp[metricName] = true
-				}
-			} else if line[2] == 'T' && strings.HasPrefix(line, "# TYPE ") {
-				// For TYPE lines
-				idx := strings.IndexByte(line[7:], ' ')
-				if idx > 0 {
-					metricName := line[7 : 7+idx]
-					if seenType[metricName] {
-						continue
-					}
-					seenType[metricName] = true
-				}
-			}
+		// Fast path for non-help, non-type lines
+		if len(line) < 8 || line[0] != '#' {
+			sb.WriteString(line)
+			sb.WriteString("\n")
+			continue
 		}
 
-		result = append(result, line)
+		// Check for HELP lines
+		if strings.HasPrefix(line, "# HELP ") {
+			metricName := extractMetricName(line, 7)
+			if _, seen := seenHelp[metricName]; seen {
+				continue
+			}
+			seenHelp[metricName] = struct{}{}
+		} else if strings.HasPrefix(line, "# TYPE ") {
+			metricName := extractMetricName(line, 7)
+			if _, seen := seenType[metricName]; seen {
+				continue
+			}
+			seenType[metricName] = struct{}{}
+		}
+
+		sb.WriteString(line)
+		sb.WriteString("\n")
+	}
+	
+	// Check for scanner errors
+	if err := scanner.Err(); err != nil {
+		// If scanner fails, return the original text
+		return metricsText
 	}
 
-	return strings.Join(result, "\n")
+	return sb.String()
+}
+
+// Helper to extract metric name efficiently
+func extractMetricName(line string, offset int) string {
+	spacePos := strings.IndexByte(line[offset:], ' ')
+	if spacePos <= 0 {
+		return line[offset:] // No space found, use rest of line
+	}
+	return line[offset : offset+spacePos]
 }

@@ -18,10 +18,10 @@ import (
 )
 
 const (
-	baseURL         = "https://api.telemetry.confluent.cloud"
-	exportPath      = "/v2/metrics/cloud/export"
-	defaultTimeout  = 60 * time.Second
-	maxRetries      = 3
+	baseURL        = "https://api.telemetry.confluent.cloud"
+	exportPath     = "/v2/metrics/cloud/export"
+	defaultTimeout = 60 * time.Second
+	maxRetries     = 3
 	// Allow this to be adjusted dynamically based on resource count
 	defaultBatchSize = 50 // Base batch size
 )
@@ -278,7 +278,7 @@ func (c *Client) fetchMetricsForBatch(ctx context.Context, resourceType string, 
 		reqStartTime := time.Now()
 		resp, err := c.httpClient.Do(req)
 		reqDuration := time.Since(reqStartTime)
-		
+
 		if reqDuration > 5*time.Second {
 			c.logger.Warn("Slow API request",
 				"resource_type", resourceType,
@@ -523,12 +523,12 @@ func deduplicateMetricsText(metricsText string) string {
 	sb.Grow(len(metricsText)) // Pre-allocate approximate size
 
 	scanner := bufio.NewScanner(strings.NewReader(metricsText))
-	
+
 	// Increase scanner buffer for larger responses
 	const maxScannerBuffer = 1024 * 1024 // 1MB
 	buf := make([]byte, maxScannerBuffer)
 	scanner.Buffer(buf, maxScannerBuffer)
-	
+
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -562,7 +562,7 @@ func deduplicateMetricsText(metricsText string) string {
 		sb.WriteString(line)
 		sb.WriteString("\n")
 	}
-	
+
 	// Check for scanner errors
 	if err := scanner.Err(); err != nil {
 		// If scanner fails, return the original text

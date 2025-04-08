@@ -13,10 +13,6 @@ spec:
     metadata:
       labels:
         app: confluent-cloud-exporter # Labels applied to the Pods
-      annotations:
-        prometheus.io/scrape: "true" # Standard annotation for Prometheus discovery
-        prometheus.io/port: "9184"   # Port Prometheus should scrape
-        prometheus.io/path: "/metrics" # Path Prometheus should scrape
     spec:
       containers:
         - name: confluent-cloud-exporter

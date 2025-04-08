@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: confluent-cloud-exporter
+  namespace: monitoring
+  labels:
+    app: confluent-cloud-exporter
+spec:
+  replicas: 1 # Run a single instance of the exporter
+  selector:
+    matchLabels:
+      app: confluent-cloud-exporter # Must match the labels in the Pod template
+  template:
+    metadata:
+      labels:
+        app: confluent-cloud-exporter # Labels applied to the Pods
+      annotations:
+        prometheus.io/scrape: "true" # Standard annotation for Prometheus discovery
+        prometheus.io/port: "9184"   # Port Prometheus should scrape
+        prometheus.io/path: "/metrics" # Path Prometheus should scrape
+    spec:
+      containers:
+        - name: confluent-cloud-exporter
+          image: cmatta/confluent-cloud-exporter:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9184 # Port the application listens on
+              name: http-metrics
+          env:
+            # Load API Key and Secret from a Kubernetes Secret
+            - name: CONFLUENT_EXPORTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: confluent-cloud-secrets # Name of your Secret
+                  key: CONFLUENT_CLOUD_API_KEY # Key within the Secret for the API key
+            - name: CONFLUENT_EXPORTER_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: confluent-cloud-secrets # Name of your Secret
+                  key: CONFLUENT_CLOUD_API_SECRET # Key within the Secret for the API secret
+            # --- Optional: Set other config via environment variables ---
+            # - name: CONFLUENT_EXPORTER_LOG_LEVEL
+            #   value: "debug"
+            - name: CONFLUENT_EXPORTER_DISCOVERY_INTERVAL
+              value: "10m"
+            - name: CONFLUENT_EXPORTER_METRICS_CACHE_DURATION
+              value: "2m"
+          # --- Optional: Mount config.yaml from a ConfigMap ---
+          # args:
+          #   - "-config.file=/config/config.yaml"
+          # volumeMounts:
+          #   - name: config-volume
+          #     mountPath: /config
+          #     readOnly: true
+          resources:
+            requests:
+              cpu: "100m" # Request 0.1 CPU core
+              memory: "128Mi" # Request 128 MB of memory
+            limits:
+              cpu: "500m" # Limit to 0.5 CPU core
+              memory: "512Mi" # Limit to 512 MB of memory
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9184
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9184
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      # --- Optional: Define the volume if mounting config.yaml ---
+      # volumes:
+      #   - name: config-volume
+      #     configMap:
+      #       name: confluent-exporter-config # Name of your ConfigMap

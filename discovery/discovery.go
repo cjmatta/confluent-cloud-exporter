@@ -24,9 +24,16 @@ type DiscoveredResource struct {
 type ResourceProvider interface {
 	// GetResources returns the current list of discovered resources
 	GetResources() []DiscoveredResource
+	// RefreshResources discovers resources from Confluent Cloud
+	RefreshResources(ctx context.Context) error
+	// IsReady indicates if the discovery service has successfully completed at least one refresh
+	IsReady() bool
 }
 
 // DiscoveryService is responsible for discovering and caching Confluent Cloud resources
+// Compile-time check to ensure DiscoveryService implements ResourceProvider
+var _ ResourceProvider = (*DiscoveryService)(nil)
+
 type DiscoveryService struct {
 	client              *confluent.Client
 	targetEnvIDs        []string
@@ -65,21 +72,23 @@ func (d *DiscoveryService) GetResources() []DiscoveredResource {
 
 // RefreshResources discovers resources from Confluent Cloud
 func (d *DiscoveryService) RefreshResources(ctx context.Context) error {
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
-
 	startTime := time.Now()
 	d.logger.Info("Starting resource discovery")
 
-	// Fetch all resources in a single unified call
+	// Fetch all resources in a single unified call - WITHOUT holding the lock
+	// This is the expensive operation that should not block GetResources() calls
 	resources, err := d.client.GetAllResources(ctx, d.targetEnvIDs)
 	if err != nil {
+		// Update error state under lock
+		d.mutex.Lock()
 		d.lastRefreshError = fmt.Errorf("failed to discover resources: %w", err)
+		d.mutex.Unlock()
+
 		d.logger.Error("Resource discovery failed", "error", err)
 		return d.lastRefreshError
 	}
 
-	// Convert to our internal format
+	// Convert to our internal format - also done outside the lock
 	discoveredResources := make([]DiscoveredResource, 0, len(resources))
 	resourceCounts := make(map[string]int)
 
@@ -106,10 +115,12 @@ func (d *DiscoveryService) RefreshResources(ctx context.Context) error {
 		resourceCounts[res.ResourceType]++
 	}
 
-	// Update the cache with the new resources
+	// Now acquire the lock ONLY to update the cache atomically
+	d.mutex.Lock()
 	d.discoveredResources = discoveredResources
 	d.lastRefreshTime = time.Now()
 	d.lastRefreshError = nil
+	d.mutex.Unlock()
 
 	// Log discovery results
 	d.logger.Info("Resource discovery completed",

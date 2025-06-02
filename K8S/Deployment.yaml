@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: confluent-cloud-exporter
+  namespace: monitoring
   labels:
     app: confluent-cloud-exporter
 spec:
@@ -16,7 +17,7 @@ spec:
     spec:
       containers:
         - name: confluent-cloud-exporter
-          image: your-registry/confluent-cloud-exporter:latest # Replace with your image
+          image: cmatta/confluent-cloud-exporter:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9184 # Port the application listens on
@@ -26,20 +27,22 @@ spec:
             - name: CONFLUENT_EXPORTER_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: confluent-cloud-credentials # Name of your Secret
-                  key: apiKey                     # Key within the Secret for the API key
+                  name: confluent-cloud-secrets # Name of your Secret
+                  key: CONFLUENT_CLOUD_API_KEY                     # Key within the Secret for the API key
             - name: CONFLUENT_EXPORTER_API_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: confluent-cloud-credentials # Name of your Secret
-                  key: apiSecret                  # Key within the Secret for the API secret
-            # --- Optional: Set other config via environment variables ---
-            # - name: CONFLUENT_EXPORTER_LOG_LEVEL
-            #   value: "debug"
-            # - name: CONFLUENT_EXPORTER_DISCOVERY_INTERVAL
-            #   value: "10m"
-            # - name: CONFLUENT_EXPORTER_METRICS_CACHE_DURATION
-            #   value: "2m"
+                  name: confluent-cloud-secrets # Name of your Secret
+                  key: CONFLUENT_CLOUD_API_SECRET                  # Key within the Secret for the API secret
+            # Enable debug logging
+            - name: CONFLUENT_EXPORTER_LOG_LEVEL
+              value: "debug"
+            # Increase discovery interval to reduce API load
+            - name: CONFLUENT_EXPORTER_DISCOVERY_INTERVAL
+              value: "15m"
+            # Increase metrics cache duration
+            - name: CONFLUENT_EXPORTER_METRICS_CACHE_DURATION
+              value: "5m"
           # --- Optional: Mount config.yaml from a ConfigMap ---
           # args:
           #   - "-config.file=/config/config.yaml"
@@ -49,11 +52,11 @@ spec:
           #     readOnly: true
           resources:
             requests:
-              cpu: "100m" # Request 0.1 CPU core
-              memory: "128Mi" # Request 128 MB of memory
+              cpu: "500m"
+              memory: "1Gi"
             limits:
-              cpu: "500m" # Limit to 0.5 CPU core
-              memory: "512Mi" # Limit to 512 MB of memory
+              cpu: "1000m"  # 1 full CPU core
+              memory: "2Gi" # 2GB of memory
           livenessProbe:
             httpGet:
               path: /healthz

@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -74,39 +72,48 @@ func main() {
 	metricsCacheDuration := flag.Duration("metrics.cache-duration", time.Minute, "Duration to cache metrics results")
 	targetEnvs := flag.String("discovery.target-environments", "", "Comma-separated list of environment IDs to discover within")
 
-	flag.Parse()
+	flag.Parse() // Standard flag parsing happens here
 
-	// Set flag values to viper (important to do this BEFORE loading config)
+	// Set config file path for Viper if provided via flag
 	if *configFile != "" {
 		viper.Set("config.file", *configFile)
-		fmt.Printf("Using config file specified via flag: %s\n", *configFile)
 	}
 
-	// Then set other CLI params
-	viper.Set("listenAddress", *listenAddr)
-	viper.Set("logLevel", *logLevel)
+	// Apply only flags that were explicitly set on the command line to Viper
+	// This allows env vars and config file values to take precedence otherwise
+	flagsSet := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		flagsSet[f.Name] = true
+	})
 
-	// Use CLI params only if provided (don't override config file)
-	if *apiKey != "" {
+	if flagsSet["web.listen-address"] {
+		viper.Set("listenAddress", *listenAddr)
+	}
+	if flagsSet["log.level"] {
+		viper.Set("logLevel", *logLevel)
+	}
+	if flagsSet["confluent.api-key"] {
 		viper.Set("apiKey", *apiKey)
 	}
-	if *apiSecret != "" {
+	if flagsSet["confluent.api-secret"] {
 		viper.Set("apiSecret", *apiSecret)
 	}
-	if *discoveryInterval != 5*time.Minute {
+	if flagsSet["discovery.interval"] {
 		viper.Set("discoveryInterval", *discoveryInterval)
 	}
-	if *metricsCacheDuration != time.Minute {
+	if flagsSet["metrics.cache-duration"] {
 		viper.Set("metricsCacheDuration", *metricsCacheDuration)
 	}
-	if *targetEnvs != "" {
+	if flagsSet["discovery.target-environments"] {
 		viper.Set("targetEnvironmentIDs", strings.Split(*targetEnvs, ","))
 	}
 
-	// Load configuration
+	// Load configuration (viper reads config file, env vars, defaults, and explicitly set flags)
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		// Use basic logger since structured logger isn't set up yet
+		slog.Error("Failed to load configuration", "error", err)
+		os.Exit(1)
 	}
 
 	// Configure structured logger
@@ -126,9 +133,9 @@ func main() {
 	registerBuildInfo(logger)
 
 	// Create a shared rate limiter for all Confluent API clients
-	// 1 request per second with burst of 5
-	discoveryLimiter := confluent.NewAdaptiveRateLimiter(2, 10) // Start with 2 rps, burst 10
-	metricsLimiter := confluent.NewAdaptiveRateLimiter(1, 5)    // Start with 1 rps, burst 5
+	// Increased rate limits for better performance - was 2 RPS / 10 burst
+	discoveryLimiter := confluent.NewAdaptiveRateLimiter(5, 20) // Increased from 2 RPS/10 burst to 5 RPS/20 burst
+	metricsLimiter := confluent.NewAdaptiveRateLimiter(2, 10)   // Increased from 1 RPS/5 burst to 2 RPS/10 burst
 
 	// Create the discovery service
 	discoveryService, err := discovery.NewDiscoveryService(
@@ -143,15 +150,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Make initial discovery more critical
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	if err := discoveryService.RefreshResources(ctx); err != nil {
-		logger.Error("Initial resource discovery failed, exporter cannot function", "error", err)
-		os.Exit(1)
-	}
-	cancel()
-
-	// Create clients with the limiter
+	// Create metrics client with the limiter
 	metricsClient := metrics.NewClient(cfg.ConfluentAPIKey, cfg.ConfluentAPISecret, metricsLimiter)
 	metricsClient.SetLogger(logger)
 
@@ -162,21 +161,6 @@ func main() {
 		cfg.MetricsCacheDuration,
 	)
 	confluentCollector.SetLogger(logger)
-
-	// Start background resource discovery
-	go func() {
-		// Set up ticker for periodic updates
-		ticker := time.NewTicker(cfg.DiscoveryInterval)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-			if err := confluentCollector.RefreshResourcesAsync(ctx); err != nil {
-				logger.Error("Background resource discovery failed", "error", err)
-			}
-			cancel()
-		}
-	}()
 
 	// Register the collector with Prometheus
 	prometheus.MustRegister(confluentCollector)
@@ -191,10 +175,6 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
-	// Set up signal handling for graceful shutdown
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
-
 	// Start HTTP server in a goroutine
 	server := &http.Server{
 		Addr: cfg.ListenAddress,
@@ -208,7 +188,42 @@ func main() {
 		}
 	}()
 
+	// Kick off initial discovery and metrics fetch in background
+	go func() {
+		logger.Info("Starting initial background discovery & metrics fetch")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if err := discoveryService.RefreshResources(ctx); err != nil {
+			logger.Error("Initial background resource discovery failed", "error", err)
+		}
+		if err := confluentCollector.RefreshMetricsAsync(ctx); err != nil {
+			logger.Error("Initial background metrics fetch failed", "error", err)
+		}
+	}()
+
+	// Start background resource discovery
+	go func() {
+		// First wait for a delay before starting the periodic updates
+		// to avoid hammering the API if the initial discovery just completed
+		time.Sleep(cfg.DiscoveryInterval)
+
+		// Set up ticker for periodic updates
+		ticker := time.NewTicker(cfg.DiscoveryInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			if err := confluentCollector.RefreshResourcesAsync(ctx); err != nil {
+				logger.Error("Background resource discovery failed", "error", err)
+			}
+			cancel()
+		}
+	}()
+
 	// Wait for termination signal
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+
 	sig := <-signalChan
 	logger.Info("Received signal, shutting down", "signal", sig)
 

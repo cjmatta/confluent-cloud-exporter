@@ -26,7 +26,10 @@ const (
 	connectorsBasePath = "/connect/v1/environments/%s/clusters/%s/connectors"
 	defaultTimeout     = 60 * time.Second // Increase from 30s to 60s
 	defaultPageSize    = 100
-	maxRetries         = 3 // Add retry constant
+	maxRetries         = 3
+	baseRetryDelay     = time.Second
+	maxRetryDelay      = 30 * time.Second
+	retryDelayMultiple = 2
 )
 
 // RateLimiter defines the interface for rate limiters
@@ -199,9 +202,20 @@ type Connector struct {
 
 // NewClient creates a new Confluent Cloud API client
 func NewClient(apiKey, apiSecret string, rateLimiter RateLimiter) *Client {
+	// Create optimized HTTP client for better performance
+	transport := &http.Transport{
+		MaxIdleConns:          100,              // Increased from default 100
+		MaxIdleConnsPerHost:   20,               // Increased from default 2
+		IdleConnTimeout:       90 * time.Second, // Keep connections alive longer
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		DisableCompression:    false, // Enable gzip compression
+	}
+
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: defaultTimeout,
+			Transport: transport,
+			Timeout:   defaultTimeout,
 		},
 		apiKey:      apiKey,
 		apiSecret:   apiSecret,
@@ -658,12 +672,15 @@ func (c *Client) GetAllResources(ctx context.Context, targetEnvIDs []string) ([]
 
 	// Create an error group for controlled parallelism
 	g, gctx := errgroup.WithContext(ctx)
-	// Limit concurrency to avoid overwhelming the API
-	semaphore := make(chan struct{}, 3) // Limit to 3 concurrent requests per environment
+	// Increase concurrency to improve performance - was 3, now 8
+	semaphore := make(chan struct{}, 8) // Increased from 3 to allow more parallel requests
 
 	// Process each environment
 	for _, env := range filteredEnvs {
 		env := env // Capture for goroutine
+
+		// Add timing for environment processing
+		envStartTime := time.Now()
 
 		// Add environment itself as a resource (do this synchronously)
 		resourcesMutex.Lock()
@@ -678,6 +695,13 @@ func (c *Client) GetAllResources(ctx context.Context, targetEnvIDs []string) ([]
 
 		// Process Kafka clusters in parallel
 		g.Go(func() error {
+			defer func() {
+				c.logger.Debug("Kafka cluster discovery completed",
+					"environment_id", env.ID,
+					"environment_name", env.Name,
+					"duration", time.Since(envStartTime).String())
+			}()
+
 			semaphore <- struct{}{}        // Acquire semaphore
 			defer func() { <-semaphore }() // Release semaphore when done
 
@@ -691,8 +715,18 @@ func (c *Client) GetAllResources(ctx context.Context, targetEnvIDs []string) ([]
 				return nil // Continue with other resources
 			}
 
+			// Early exit if no clusters (likely empty environment)
+			if len(kafkaClusters) == 0 {
+				c.logger.Debug("No Kafka clusters found in environment, skipping connector discovery",
+					"environment_id", env.ID,
+					"environment_name", env.Name)
+				return nil
+			}
+
 			// Process each Kafka cluster
 			var clusterResources []Resource
+			var connectorGoroutines []func() error
+
 			for _, cluster := range kafkaClusters {
 				r := Resource{
 					ID:           cluster.ID,
@@ -708,8 +742,9 @@ func (c *Client) GetAllResources(ctx context.Context, targetEnvIDs []string) ([]
 				}
 				clusterResources = append(clusterResources, r)
 
-				// Process connectors for this cluster in a separate goroutine
-				g.Go(func() error {
+				// Collect connector discovery functions instead of spawning immediately
+				cluster := cluster // Capture for closure
+				connectorGoroutines = append(connectorGoroutines, func() error {
 					semaphore <- struct{}{}        // Acquire semaphore
 					defer func() { <-semaphore }() // Release semaphore when done
 
@@ -754,6 +789,11 @@ func (c *Client) GetAllResources(ctx context.Context, targetEnvIDs []string) ([]
 				resourcesMutex.Lock()
 				allResources = append(allResources, clusterResources...)
 				resourcesMutex.Unlock()
+			}
+
+			// Now spawn connector discovery goroutines
+			for _, connectorFunc := range connectorGoroutines {
+				g.Go(connectorFunc)
 			}
 
 			return nil

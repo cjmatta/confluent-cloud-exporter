@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -36,7 +37,7 @@ func LoadConfig() (*Config, error) {
 	configFile := viper.GetString("config.file")
 	if configFile != "" {
 		// Read the file directly
-		fmt.Printf("Loading configuration from file: %s\n", configFile)
+		slog.Info("Loading configuration from file", "file", configFile)
 
 		// Check if file exists
 		if _, err := os.Stat(configFile); os.IsNotExist(err) {
@@ -60,10 +61,10 @@ func LoadConfig() (*Config, error) {
 		if configFile != "" {
 			return nil, fmt.Errorf("error reading config file: %w", err)
 		} else {
-			fmt.Println("No configuration file found, using defaults and environment variables")
+			slog.Info("No configuration file found, using defaults and environment variables")
 		}
 	} else {
-		fmt.Printf("Using config file: %s\n", viper.ConfigFileUsed())
+		slog.Info("Using config file", "file", viper.ConfigFileUsed())
 	}
 
 	// Map environment variables
@@ -71,6 +72,9 @@ func LoadConfig() (*Config, error) {
 	viper.BindEnv("apiSecret", "CONFLUENT_EXPORTER_API_SECRET")
 	viper.BindEnv("listenAddress", "CONFLUENT_EXPORTER_LISTEN_ADDRESS")
 	viper.BindEnv("logLevel", "CONFLUENT_EXPORTER_LOG_LEVEL")
+	viper.BindEnv("discoveryInterval", "CONFLUENT_EXPORTER_DISCOVERY_INTERVAL")
+	viper.BindEnv("metricsCacheDuration", "CONFLUENT_EXPORTER_METRICS_CACHE_DURATION")
+	viper.BindEnv("targetEnvironmentIDs", "CONFLUENT_EXPORTER_TARGET_ENVIRONMENT_IDS")
 
 	// Parse configuration
 	var config Config
@@ -80,11 +84,11 @@ func LoadConfig() (*Config, error) {
 
 	// Validate required configuration
 	if config.ConfluentAPIKey == "" {
-		fmt.Println("Warning: No Confluent API Key provided. Set 'apiKey' in config file or CONFLUENT_EXPORTER_API_KEY environment variable.")
+		slog.Warn("No Confluent API Key provided. Set 'apiKey' in config file or CONFLUENT_EXPORTER_API_KEY environment variable.")
 	}
 
 	if config.ConfluentAPISecret == "" {
-		fmt.Println("Warning: No Confluent API Secret provided. Set 'apiSecret' in config file or CONFLUENT_EXPORTER_API_SECRET environment variable.")
+		slog.Warn("No Confluent API Secret provided. Set 'apiSecret' in config file or CONFLUENT_EXPORTER_API_SECRET environment variable.")
 	}
 
 	return &config, nil

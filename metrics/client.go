@@ -20,8 +20,8 @@ import (
 const (
 	baseURL        = "https://api.telemetry.confluent.cloud"
 	exportPath     = "/v2/metrics/cloud/export"
-	defaultTimeout = 60 * time.Second
-	maxRetries     = 3
+	defaultTimeout = 120 * time.Second // Increased from 60s to 120s for Kubernetes environments
+	maxRetries     = 5                 // Increased from 3 to 5
 	// Allow this to be adjusted dynamically based on resource count
 	defaultBatchSize = 50 // Base batch size
 )
@@ -207,7 +207,7 @@ func (c *Client) fetchMetricsForBatch(ctx context.Context, resourceType string, 
 	}()
 
 	// Create a timeout specifically for this batch request
-	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	requestCtx, cancel := context.WithTimeout(ctx, 45*time.Second) // Increased from 20s to 45s for Kubernetes environments
 	defer cancel()
 
 	// Debug log the exact details of this batch

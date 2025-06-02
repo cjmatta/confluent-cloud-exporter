@@ -6,7 +6,7 @@ A Prometheus exporter for Confluent Cloud that dynamically discovers resources a
 
 Confluent Cloud provides a rich set of metrics through its API, but there isn't an official, widely adopted Prometheus exporter that handles dynamic resource discovery across an entire organization. This exporter aims to fill that gap by:
 
-1.  **Dynamic Discovery:** Automatically finding Kafka clusters, connectors, schema registries, ksqlDB clusters, and compute pools across specified environments (or all environments).
+1.  **Dynamic Discovery:** Automatically finding Kafka clusters, connectors, schema registries, ksqlDB clusters, and Flink compute pools across specified environments (or all environments).
 2.  **Efficient Metrics Fetching:** Using the `/v2/metrics/cloud/export` endpoint to retrieve metrics in Prometheus format efficiently.
 3.  **Standard Prometheus Integration:** Exposing metrics in a format easily consumable by Prometheus.
 
@@ -75,8 +75,8 @@ listenAddress: ":9184"
 logLevel: "info"
 
 # Discovery and Caching
-discoveryInterval: 10m
-metricsCacheDuration: 2m
+discoveryInterval: 15m
+metricsCacheDuration: 1m
 
 # Optional: Filter discovery to specific environments
 # targetEnvironmentIDs:

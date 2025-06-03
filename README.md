@@ -169,11 +169,41 @@ The exporter automatically enriches these metrics with labels discovered via the
 -   `environment_id`
 -   `environment_name`
 -   `cluster_id` (where applicable)
--   `name` (human-readable resource name)
+-   Resource-specific name labels:
+    -   `kafka_name` (for Kafka clusters)
+    -   `connector_name` (for connectors)
+    -   `schema_registry_name` (for Schema Registry instances)
+    -   `ksqldb_name` (for KsqlDB instances)
+    -   `compute_pool_name` (for Compute Pools)
+    -   `environment_name` (for environments)
 -   `display_name`
 -   Other resource-specific labels (e.g., `cloud`, `region`, `connector_type`)
 
 Refer to the [Confluent Cloud Metrics API Documentation](https://docs.confluent.io/cloud/current/monitoring/metrics-api.html) for a full list of available metrics.
+
+### Example Metrics with Labels
+
+Here are examples of how metrics appear with the resource-type-specific name labels:
+
+```prometheus
+# Kafka cluster metrics
+confluent_kafka_server_received_bytes{kafka_id="lkc-123456", kafka_name="production-cluster", environment_id="env-abc123", environment_name="production", cloud="aws", region="us-west-2"} 1024000
+
+# Connector metrics  
+confluent_kafka_connect_connector_status{connector_id="lcc-789012", connector_name="postgres-sink", connector_type="PostgresSink", environment_id="env-abc123", environment_name="production", cluster_id="lkc-123456"} 1
+
+# Schema Registry metrics
+confluent_schema_registry_schema_count{schema_registry_id="lsrc-345678", schema_registry_name="production-sr", environment_id="env-abc123", environment_name="production", cloud="aws", region="us-west-2"} 25
+
+# Compute Pool metrics
+confluent_flink_compute_pool_utilization_current_cfus{compute_pool_id="lfcp-901234", compute_pool_name="production-pool", environment_id="env-abc123", environment_name="production", cloud="aws", region="us-west-2"} 4
+```
+
+This naming convention creates consistent pairing between ID and name labels:
+- `kafka_id` + `kafka_name`
+- `connector_id` + `connector_name` 
+- `schema_registry_id` + `schema_registry_name`
+- `compute_pool_id` + `compute_pool_name`
 
 ## Health Check
 

@@ -450,10 +450,30 @@ func (c *ConfluentCollector) processMetrics(metricsText string, ch chan<- promet
 			if resourceID != "" {
 				c.resourceMutex.RLock()
 				if resource, ok := c.resourcesByID[resourceID]; ok {
-					// Add resource metadata as labels
-					if resource.Name != "" && !containsLabel(labelKeys, "name") {
-						labelKeys = append(labelKeys, "name")
-						labelValues = append(labelValues, resource.Name)
+					// Add resource metadata as labels with resource-type-specific names
+					if resource.Name != "" {
+						var nameLabel string
+						switch resource.Type {
+						case "kafka":
+							nameLabel = "kafka_name"
+						case "connector":
+							nameLabel = "connector_name"
+						case "schema_registry":
+							nameLabel = "schema_registry_name"
+						case "ksqldb":
+							nameLabel = "ksqldb_name"
+						case "compute_pool":
+							nameLabel = "compute_pool_name"
+						case "environment":
+							nameLabel = "environment_name"
+						default:
+							nameLabel = "name" // fallback for unknown types
+						}
+
+						if !containsLabel(labelKeys, nameLabel) {
+							labelKeys = append(labelKeys, nameLabel)
+							labelValues = append(labelValues, resource.Name)
+						}
 					}
 
 					if resource.EnvironmentID != "" && !containsLabel(labelKeys, "environment_id") {
